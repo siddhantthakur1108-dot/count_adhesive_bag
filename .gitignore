@@ -1,0 +1,4 @@
+*.mp4
+/Tile_adhesive.v2i.yolov8
+yolo26n.pt
+yolov8s.pt
