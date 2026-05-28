@@ -29,10 +29,10 @@ fps        = cap.get(cv2.CAP_PROP_FPS)
 FRAME_W = 640
 FRAME_H = 480
 
-# ── Video Writer ──────────────────────────────────────────────────────────── ← NEW
-output_path = r"C:\Users\siddh\Desktop\adhesive_bag\output2_inference.mp4"    # ← NEW
-fourcc      = cv2.VideoWriter_fourcc(*'mp4v')                                 # ← NEW
-out         = cv2.VideoWriter(output_path, fourcc, fps, (FRAME_W, FRAME_H))  # ← NEW
+# ── Video Writer ──────────────────────────────────────────────────────────── 
+output_path = r"C:\Users\siddh\Desktop\adhesive_bag\output2_inference.mp4"   
+fourcc      = cv2.VideoWriter_fourcc(*'mp4v')                                 
+out         = cv2.VideoWriter(output_path, fourcc, fps, (FRAME_W, FRAME_H))  
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TUNING KNOBS
@@ -254,7 +254,7 @@ while cap.isOpened():
 
         # Center dot
         cv2.circle(frame, (cx, cy), 6, dot_col, -1)
-        cv2.circle(frame, (cx, cy), 6, (0, 0, 0), 1)   # thin black border
+        cv2.circle(frame, (cx, cy), 6, (0, 0, 0), 1)   
 
         # ID label (with confirmation progress if pending)
         if has_pend:
@@ -317,15 +317,15 @@ while cap.isOpened():
                 (10, FRAME_H-10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.30, (160, 160, 160), 1)
 
-    # ── Save frame ────────────────────────────────────────────────────────── ← NEW
-    out.write(frame)                                                           # ← NEW
+    # ── Save frame ────────────────────────────────────────────────────────── 
+    out.write(frame)                                                           
 
     cv2.imshow("Bag Counter", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 cap.release()
-out.release()                                                                  # ← NEW
+out.release()                                                                 
 cv2.destroyAllWindows()
 print(f"\nFinal bag count : {count}")
 print(f"Saved video     : {output_path}")
