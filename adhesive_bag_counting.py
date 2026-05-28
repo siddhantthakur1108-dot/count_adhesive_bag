@@ -10,37 +10,45 @@ model = YOLO(r"runs\detect\runs\adhesive_bag\phase1\weights\best.pt")
 
 # ── DeepSORT ──────────────────────────────────────────────────────────────────
 tracker = DeepSort(
-    max_age             = 20,
+    max_age             = 10,
     n_init              = 2,
-    max_cosine_distance = 0.3,
+    max_cosine_distance = 0.70,
     nn_budget           = 100,
-    max_iou_distance    = 0.7,
+    max_iou_distance    = 0.85,
     embedder            = "mobilenet",
     half                = True,
     bgr                 = True,
 )
 
 # ── Video ─────────────────────────────────────────────────────────────────────
-video_path = r"C:\Users\siddh\Desktop\adhesive_bag\merged_output_adhesive - Trim - Trim.mp4"
+video_path = r"C:\Users\siddh\Desktop\adhesive_bag\merged_output2.mp4"
 cap        = cv2.VideoCapture(video_path)
-fps        = cap.get(cv2.CAP_PROP_FPS) or 30
+fps        = cap.get(cv2.CAP_PROP_FPS)
+
 
 FRAME_W = 640
-FRAME_H = 640
+FRAME_H = 480
+
+# ── Video Writer ──────────────────────────────────────────────────────────── ← NEW
+output_path = r"C:\Users\siddh\Desktop\adhesive_bag\output2_inference.mp4"    # ← NEW
+fourcc      = cv2.VideoWriter_fourcc(*'mp4v')                                 # ← NEW
+out         = cv2.VideoWriter(output_path, fourcc, fps, (FRAME_W, FRAME_H))  # ← NEW
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TUNING KNOBS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-LINE_Y                    = 250
-LINE_THICKNESS            = 2     
+LINE_Y                    = (FRAME_H//2) + 40
+LINE_THICKNESS            = 1
 SMOOTH_WINDOW             = 8
-FORWARD_CONFIRM_FRAMES    = 3
+FORWARD_CONFIRM_FRAMES    = 1
 BACKWARD_CONFIRM_FRAMES   = 8
-FORWARD_MIN_DISPLACEMENT  = 20
+FORWARD_MIN_DISPLACEMENT  = 5
 BACKWARD_MIN_DISPLACEMENT = 40
-DANGER_MARGIN             = 70
-GRAVEYARD_TTL             = 45
-GRAVEYARD_MATCH_PX        = 60
+DANGER_MARGIN             = 50
+GRAVEYARD_TTL             = 35
+GRAVEYARD_MATCH_PX        = 70
+DOUBLE_COUNT_RADIUS       = 90
+MERGE_RADIUS              = 40
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -55,6 +63,7 @@ track_cy_hist        = defaultdict(lambda: deque(maxlen=4))
 track_confirmed_side = {}
 pending              = {}
 graveyard            = {}
+recent_commits       = deque(maxlen=10) 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def smoothed_cx(track_id):
@@ -110,9 +119,10 @@ while cap.isOpened():
     frame        = cv2.resize(frame, (FRAME_W, FRAME_H))
     frame_number += 1
     seen_ids     = set()
+    processed_positions = []
 
     # ── YOLO ──────────────────────────────────────────────────────────────────
-    results    = model(frame, imgsz=640, conf=0.5, iou=0.45, verbose=False)
+    results    = model(frame, imgsz=640, conf=0.65, iou=0.90, verbose=False)
     detections = []
     for r in results:
         for box in r.boxes:
@@ -157,6 +167,19 @@ while cap.isOpened():
         track_cy_hist[track_id].append(cy)
 
         cx           = smoothed_cx(track_id)
+
+        is_duplicate = any(
+            np.hypot(cx - px, cy - py) < MERGE_RADIUS
+            for px, py in processed_positions
+        )
+        if is_duplicate:
+            # Still draw a dim dot so you can see it was suppressed
+            cv2.circle(frame, (cx, cy), 4, (80, 80, 80), -1)   # grey = suppressed
+            continue   # skip state machine, skip counting
+
+        processed_positions.append((cx, cy))   # mark this position as handled
+        # ── rest of per-track logic continues unchanged below ─────────────────
+
         current_side = get_side(cy)
         seen_ids.add(track_id)
 
@@ -279,26 +302,30 @@ while cap.isOpened():
 
     # ── Flash ─────────────────────────────────────────────────────────────────
     if flash_event and (time.time() - flash_time) < FLASH_DURATION:
-        fc  = (0, 255, 0)  if flash_event == '+' else (0, 0, 255)
-        txt = "+1  FORWARD" if flash_event == '+' else "-1  BACKWARD"
-        cv2.putText(frame, txt, (LINE_Y + 15, 200),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.1, fc, 3)
+        fc  = (0, 255, 0) if flash_event == '+' else (0, 0, 255)
+        #txt = {count} if flash_event == '+' else "-1"
+        cv2.putText(frame, f"{count}", (cx, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1,(255,255,255), 2)
     else:
         flash_event = None
 
     # ── HUD ───────────────────────────────────────────────────────────────────
-    cv2.rectangle(frame, (0, 0), (250, 72), (0, 0, 0), -1)
-    cv2.putText(frame, f"Bags counted: {count}", (10, 42),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3)
+    cv2.putText(frame, f"Bags counted: {count}", (10, FRAME_H -20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
     cv2.putText(frame,
                 f"Active: {len(seen_ids)}  Pending: {len(pending)}",
-                (10, 64),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 160, 160), 1)
+                (10, FRAME_H-10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.30, (160, 160, 160), 1)
+
+    # ── Save frame ────────────────────────────────────────────────────────── ← NEW
+    out.write(frame)                                                           # ← NEW
 
     cv2.imshow("Bag Counter", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 cap.release()
+out.release()                                                                  # ← NEW
 cv2.destroyAllWindows()
-print(f"\nFinal bag count: {count}")
+print(f"\nFinal bag count : {count}")
+print(f"Saved video     : {output_path}")
