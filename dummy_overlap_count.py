@@ -34,8 +34,8 @@ video_path = r"C:\Users\siddh\Desktop\adhesive_bag\merged_overlapped.mp4"
 cap        = cv2.VideoCapture(video_path)
 fps        = cap.get(cv2.CAP_PROP_FPS)
 
-FRAME_W = 640
-FRAME_H = 480
+FRAME_W = 1080
+FRAME_H = 920
 
 # ── Video Writer ───────────────────────────────────────────────────────────────
 output_path = r"C:\Users\siddh\Desktop\adhesive_bag\overlapped_test.mp4"
@@ -169,7 +169,7 @@ while cap.isOpened():
     processed_positions = []
 
     # ── YOLO ──────────────────────────────────────────────────────────────────
-    results    = model(frame, imgsz=640, conf=0.70, iou=0.90, verbose=False)
+    results    = model(frame, imgsz=1080, conf=0.70, iou=0.90, verbose=False)
     detections = []
     for r in results:
         for box in r.boxes:
@@ -308,8 +308,8 @@ while cap.isOpened():
             text_y = max(18, cy - 14)
             cv2.putText(frame, count_txt, (text_x, text_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
-            cv2.putText(frame, count_txt, (text_x, text_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 1)
+            #cv2.putText(frame, count_txt, (text_x, text_y),
+                        #cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 1)
 
         # Label — show OVR tag on overlapped bags
         label = "OVR" if is_overlapped else ""
