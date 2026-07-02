@@ -250,7 +250,7 @@ while True:
     processed_positions = []
 
     # ── YOLO (batched tensor extraction — one GPU→CPU sync per frame, not per box) ─
-    results    = model(frame, imgsz=640, conf=0.65, iou=0.90, verbose=False,
+    results    = model(frame, imgsz=640, conf=0.2, iou=0.90, verbose=False,
                         device=DEVICE, half=USE_HALF)
     detections = []
     for r in results:
