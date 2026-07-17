@@ -13,10 +13,10 @@ from collections import defaultdict, deque
 DEVICE   = 'cuda' if torch.cuda.is_available() else 'cpu'
 USE_HALF = (DEVICE == 'cuda')
 print(f"[DEVICE] Running on {DEVICE}  (half precision: {USE_HALF})")
-USE_HW_VIDEO_IO = True
+USE_HW_VIDEO_IO = False
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-model = YOLO(r"/Users/apple/Downloads/best(2:07:2026).pt")
+model = YOLO(r"C:\Users\siddh\Desktop\adhesive_bag\runs\detect\improved_overlapped\train_head_improved_overlapped\weights\best.pt")
 model.to(DEVICE)
 try:
     model.fuse()
@@ -29,7 +29,7 @@ OVERLAP_CLASS_ID  = next((k for k, v in CLASS_NAMES.items() if v == 'overlapped'
 
 # ── DeepSORT (New Logic Parameters) ──────────────────────────────────────────
 tracker = DeepSort(
-    max_age             = 20, 
+    max_age             = 10,
     n_init              = 3,
     max_cosine_distance = 0.60,
     nn_budget           = 100,
@@ -43,7 +43,7 @@ tracker = DeepSort(
 # ── Video ─────────────────────────────────────────────────────────────────────
 FRAME_W, FRAME_H = 640, 480
 
-video_path = r""
+video_path = r"C:\Users\siddh\Desktop\adhesive_bag\merged_overlapped.mp4"
 if USE_HW_VIDEO_IO:
     gst_in = (
                 f'filesrc location="{video_path}" ! qtdemux ! h264parse ! '
@@ -51,9 +51,9 @@ if USE_HW_VIDEO_IO:
                 f'videoconvert ! video/x-raw,format=BGR ! '
                 f'queue max-size-buffers=200 leaky=downstream ! appsink sync=true'
             )
-    cap = cv2.VideoCapture(gst_in, cv2.CAP_GSTREAMER)        
+    cap = cv2.VideoCapture(gst_in, cv2.CAP_GSTREAMER)
 else:
-    cap        = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(video_path)
 if not cap.isOpened():
     raise RuntimeError(f"Coould not open video : {video_path}")
 
@@ -62,7 +62,7 @@ fps        = cap.get(cv2.CAP_PROP_FPS)
 
 
 # ── Video Writer ───────────────────────────────────────────────────────────────
-output_path = r"/Users/apple/Downloads/A tileadhisive cctv footage/results/processed_output.mp4"
+output_path = r"C:\Users\siddh\Desktop\adhesive_bag\Test Videos\test1707.mp4"
 
 output_dir = os.path.dirname(output_path)
 
@@ -88,9 +88,18 @@ GRAVEYARD_TTL             = 35
 GRAVEYARD_MATCH_PX        = 70
 
 # New Logic: Class Specific Merging Radius
-MERGE_RADIUS_GREEN        = 25 
-MERGE_RADIUS_PINK         = 30 
-COUNT_DEDUP_RADIUS        = 20 
+MERGE_RADIUS_GREEN        = 25
+MERGE_RADIUS_PINK         = 30
+COUNT_DEDUP_RADIUS        = 20
+
+# ── STACK-PAIR SUPPRESSION (NEW) ─────────────────────────────────────────────
+# A 'bag' box directly above an 'overlapped' box is the top half of the same
+# physical stack, not a second object. These knobs define "directly above":
+# tune against your own footage — start here and adjust if pairs are
+# missed (widen) or unrelated bags get merged (narrow).
+STACK_MAX_DX   = 40   # max horizontal centroid offset to count as "same column"
+STACK_MIN_GAP  = -15  # allow slight vertical box overlap (negative = boxes overlap)
+STACK_MAX_GAP  = 60   # max vertical gap between bag-bottom and overlap-top
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # ── State ─────────────────────────────────────────────────────────────────────
@@ -107,7 +116,7 @@ track_is_overlap     = defaultdict(bool) # Sticky class logic
 pending              = {}
 graveyard            = {}
 # Format: (cx, cy, frame, is_ovr)
-recent_commits       = deque(maxlen=20) 
+recent_commits       = deque(maxlen=20)
 counted_tracks       = {}
 
 
@@ -143,6 +152,35 @@ def get_side(cy): return 'bottom' if cy > LINE_Y else 'top'
 def net_displacement(crossed_at_cy, current_cy, direction):
     return crossed_at_cy - current_cy if direction == 'forward' else current_cy - crossed_at_cy
 
+def suppress_paired_bag_boxes(detections, bag_cls, ovr_cls):
+    """A 'bag' box sitting directly above an 'overlapped' box is the top half
+    of the same physical stack, not a separate object. Drop that bag box so
+    only the overlapped box (representing the whole stack) reaches the
+    tracker — this prevents one physical stack from producing two tracks,
+    two crossings, and a double count.
+
+    detections: list of (bbox, conf, cls_id) where bbox = [x, y, w, h]
+    """
+    bag_dets = [d for d in detections if d[2] == bag_cls]
+    ovr_dets = [d for d in detections if d[2] == ovr_cls]
+    other    = [d for d in detections if d[2] not in (bag_cls, ovr_cls)]
+
+    kept_bags = []
+    for bag in bag_dets:
+        bx, by, bw, bh = bag[0]
+        bcx, b_bottom = bx + bw / 2, by + bh
+        paired = False
+        for ovr in ovr_dets:
+            ox, oy, ow, _ = ovr[0]
+            ocx, o_top = ox + ow / 2, oy
+            if abs(bcx - ocx) < STACK_MAX_DX and STACK_MIN_GAP < (o_top - b_bottom) < STACK_MAX_GAP:
+                paired = True
+                break
+        if not paired:
+            kept_bags.append(bag)
+
+    return kept_bags + ovr_dets + other
+
 def commit_cross(track_id, direction, cx, cy):
     global count, overlap_count, flash_event, flash_time
     is_ovr = track_is_overlap[track_id]
@@ -171,9 +209,15 @@ def commit_cross(track_id, direction, cx, cy):
         count += 1; flash_event = '+'
     flash_time = time.time()
 
-def find_graveyard_match(cx, cy):
+def find_graveyard_match(cx, cy, is_ovr):
+    """Class-aware graveyard matching: a lost 'bag' track must only be
+    re-matched to a lost 'bag' track, never to an 'overlapped' one (and
+    vice versa). Without this, two spatially-close-but-different-class
+    tracks can swap side/counted state and silently corrupt the count."""
     best_id, best_dist = None, GRAVEYARD_MATCH_PX
     for old_id, state in graveyard.items():
+        if state.get('is_ovr') != is_ovr:
+            continue
         dist = np.hypot(cx - state['cx'], cy - state['cy'])
         if dist < best_dist:
             best_dist, best_id = dist, old_id
@@ -203,13 +247,37 @@ while True:
     seen_ids = set()
 
     # 1. Detection (New Logic: lower IOU to merge redundant boxes)
+    
+    BAG_CONF = 0.25
+    OVERLAP_CONF = 0.75   # Higher confidence for overlapped class
     results = model(frame, imgsz=640, conf=0.25, iou=0.45, verbose=False, device=DEVICE, half=USE_HALF)
     detections = []
     for r in results:
-        if r.boxes is None: continue
+        if r.boxes is None:
+            continue
+
         for box in r.boxes:
+            cls = int(box.cls[0])
+            conf = float(box.conf[0])
+
+            # Class-specific confidence filtering
+            if cls == BAG_CLASS_ID and conf < BAG_CONF:
+                continue
+
+            if cls == OVERLAP_CLASS_ID and conf < OVERLAP_CONF:
+                continue
+
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            detections.append(([float(x1), float(y1), float(x2-x1), float(y2-y1)], float(box.conf[0].cpu().numpy()), int(box.cls[0].cpu().numpy())))
+
+            detections.append((
+                [float(x1), float(y1), float(x2-x1), float(y2-y1)],
+                conf,
+                cls
+            ))
+
+    # 1b. NEW: collapse paired top-bag + bottom-overlap boxes into one
+    # detection so a single stack doesn't get tracked/counted as two objects.
+    detections = suppress_paired_bag_boxes(detections, BAG_CLASS_ID, OVERLAP_CLASS_ID)
 
     # 2. DeepSORT
     tracks = tracker.update_tracks(detections, frame=frame)
@@ -234,9 +302,9 @@ while True:
             track_coords[tid] = (rcx, rcy)
         else:
             pcx, pcy = track_coords[tid]
-            track_coords[tid] = (int(SMOOTH_ALPHA*rcx + (1-SMOOTH_ALPHA)*pcx), 
+            track_coords[tid] = (int(SMOOTH_ALPHA*rcx + (1-SMOOTH_ALPHA)*pcx),
                                  int(SMOOTH_ALPHA*rcy + (1-SMOOTH_ALPHA)*pcy))
-        
+
         cx, cy = track_coords[tid]
         candidates.append({'id': tid, 'cx': cx, 'cy': cy, 'is_ovr': track_is_overlap[tid]})
 
@@ -247,7 +315,7 @@ while True:
 
     for cand in candidates:
         tid, cx, cy, is_ovr = cand['id'], cand['cx'], cand['cy'], cand['is_ovr']
-        
+
         # Radius check based on class
         if is_ovr:
             if any(np.hypot(cx-px, cy-py) < MERGE_RADIUS_PINK for px, py in processed_pink): continue
@@ -255,12 +323,12 @@ while True:
         else:
             if any(np.hypot(cx-px, cy-py) < MERGE_RADIUS_GREEN for px, py in processed_green): continue
             processed_green.append((cx, cy))
-        
+
         # seen_ids.add(tid)
 
-        # 4. Graveyard inheritance (Earlier logic structure)
+        # 4. Graveyard inheritance (class-aware match — NEW)
         if tid not in track_confirmed_side:
-            old_id = find_graveyard_match(cx, cy)
+            old_id = find_graveyard_match(cx, cy, is_ovr)
             if old_id:
                 track_confirmed_side[tid] = graveyard[old_id]['side']
                 track_is_overlap[tid] = track_is_overlap[old_id]
@@ -292,17 +360,23 @@ while True:
         # 6. Visualization (New Logic colors)
         color = (255, 0, 255) if is_ovr else (0, 255, 0)
         if not is_ovr and current_side == 'top': color = (255, 140, 0) # Orange
-        
+
         cv2.circle(frame, (cx, cy), 6, color, -1)
         cv2.circle(frame, (cx, cy), 7, (255, 255, 255), 1)
         if is_ovr:
             cv2.putText(frame, "OVR", (cx + 8, cy - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
 
-    # Move lost tracks to graveyard
+    # Move lost tracks to graveyard (now stores is_ovr for class-aware match)
     for lost_id in set(track_confirmed_side.keys()) - seen_ids:
         if lost_id not in graveyard and lost_id in track_coords:
             cx, cy = track_coords[lost_id]
-            graveyard[lost_id] = {'cx': cx, 'cy': cy, 'side': track_confirmed_side[lost_id], 'frame_dropped': frame_number, 'counted': counted_tracks.get(lost_id, False)}
+            graveyard[lost_id] = {
+                'cx': cx, 'cy': cy,
+                'side': track_confirmed_side[lost_id],
+                'frame_dropped': frame_number,
+                'counted': counted_tracks.get(lost_id, False),
+                'is_ovr': track_is_overlap.get(lost_id, False),
+            }
 
     purge_expired_graveyard()
 
@@ -318,4 +392,49 @@ while True:
         cv2.imshow("Detection Logic Integrated", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
 
-reader.stop(); writer.stop(); cap.release(); out.release(); cv2.destroyAllWindows()
+# reader.stop(); writer.stop(); cap.release(); out.release(); cv2.destroyAllWindows()
+
+reader = FrameReader(cap, (FRAME_W, FRAME_H))
+reader.start()
+
+writer = FrameWriter(out)
+writer.start()
+
+try:
+
+    while True:
+
+        frame = reader.read()
+
+        if frame is None:
+            break
+
+        
+       
+        writer.write(frame)
+
+        if SHOW_PREVIEW:
+            cv2.imshow("Detection Logic Integrated", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+
+except KeyboardInterrupt:
+    print("\nStopping...")
+
+finally:
+
+    reader.stop()
+    reader.join()
+
+    writer.stop()
+
+    cap.release()
+
+    cv2.destroyAllWindows()
+
+    for _ in range(5):
+        cv2.waitKey(1)
+
+    print("Cleanup complete.")
