@@ -13,6 +13,7 @@ from collections import defaultdict, deque
 DEVICE   = 'cuda' if torch.cuda.is_available() else 'cpu'
 USE_HALF = (DEVICE == 'cuda')
 print(f"[DEVICE] Running on {DEVICE}  (half precision: {USE_HALF})")
+USE_HW_VIDEO_IO = True
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 model = YOLO(r"/Users/apple/Downloads/best(2:07:2026).pt")
@@ -28,7 +29,7 @@ OVERLAP_CLASS_ID  = next((k for k, v in CLASS_NAMES.items() if v == 'overlapped'
 
 # ── DeepSORT (New Logic Parameters) ──────────────────────────────────────────
 tracker = DeepSort(
-    max_age             = 30, 
+    max_age             = 20, 
     n_init              = 3,
     max_cosine_distance = 0.60,
     nn_budget           = 100,
@@ -40,11 +41,25 @@ tracker = DeepSort(
 )
 
 # ── Video ─────────────────────────────────────────────────────────────────────
-video_path = r"/Users/apple/Downloads/A tileadhisive cctv footage/footage4_merged_clips.mp4"
-cap        = cv2.VideoCapture(video_path)
+FRAME_W, FRAME_H = 640, 480
+
+video_path = r""
+if USE_HW_VIDEO_IO:
+    gst_in = (
+                f'filesrc location="{video_path}" ! qtdemux ! h264parse ! '
+                f'nvv4l2decoder ! nvvidconv ! video/x-raw,format=BGRx,width={FRAME_W},height={FRAME_H} ! '
+                f'videoconvert ! video/x-raw,format=BGR ! '
+                f'queue max-size-buffers=200 leaky=downstream ! appsink sync=true'
+            )
+    cap = cv2.VideoCapture(gst_in, cv2.CAP_GSTREAMER)        
+else:
+    cap        = cv2.VideoCapture(video_path)
+if not cap.isOpened():
+    raise RuntimeError(f"Coould not open video : {video_path}")
+
 fps        = cap.get(cv2.CAP_PROP_FPS)
 
-FRAME_W, FRAME_H = 640, 480
+
 
 # ── Video Writer ───────────────────────────────────────────────────────────────
 output_path = r"/Users/apple/Downloads/A tileadhisive cctv footage/results/processed_output.mp4"
@@ -65,7 +80,7 @@ SHOW_PREVIEW = True
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 LINE_Y                    = (FRAME_H // 2) + 40
 SMOOTH_ALPHA              = 0.25  # New Logic: EMA Smoothing
-FORWARD_CONFIRM_FRAMES    = 2
+FORWARD_CONFIRM_FRAMES    = 1
 BACKWARD_CONFIRM_FRAMES   = 8
 FORWARD_MIN_DISPLACEMENT  = 10
 DANGER_MARGIN             = 50
@@ -98,7 +113,7 @@ counted_tracks       = {}
 
 # ── Threaded I/O ──────────────────────────────────────────────────────────────
 class FrameReader(threading.Thread):
-    def __init__(self, cap, size, queue_size=10):
+    def __init__(self, cap, size, queue_size=1):
         super().__init__(daemon=True)
         self.cap, self.size, self.q, self.stopped = cap, size, queue.Queue(maxsize=queue_size), False
     def run(self):
@@ -208,6 +223,8 @@ while True:
         l, t, r_c, b = track.to_ltrb()
         rcx, rcy = int((l + r_c) / 2), int((t + b) / 2)
 
+        seen_ids.add(tid)
+
         # New Logic: Sticky Class (Once overlapped, always overlapped)
         if track.det_class == OVERLAP_CLASS_ID:
             track_is_overlap[tid] = True
@@ -239,7 +256,7 @@ while True:
             if any(np.hypot(cx-px, cy-py) < MERGE_RADIUS_GREEN for px, py in processed_green): continue
             processed_green.append((cx, cy))
         
-        seen_ids.add(tid)
+        # seen_ids.add(tid)
 
         # 4. Graveyard inheritance (Earlier logic structure)
         if tid not in track_confirmed_side:
