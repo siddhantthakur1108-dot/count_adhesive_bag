@@ -1,14 +1,14 @@
-
 import sys
 import cv2
 import time
 import math
 import numpy as np
+import torch
+import os
 from datetime import datetime
 from collections import defaultdict, deque
 
 from ultralytics import YOLO
-from deep_sort_realtime.deepsort_tracker import DeepSort
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -63,74 +63,162 @@ BORDER_GLOW    = "#1E3A6F"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  BACKEND  —  YOLO + DeepSORT counting thread
+#  BACKEND  —  YOLO + ByteTrack counting thread (ported from bag_counter_fixed.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CountingThread(QThread):
     """
-    Runs YOLO detection + DeepSORT tracking + line-crossing counting in a
-    background thread.  Emits:
-      frame_ready(QImage)   — annotated frame for the video widget
-      stats_updated(int, int) — (total_count, overlap_count)
+    Runs YOLO detection + built-in ByteTrack tracking + line-crossing
+    counting in a background thread.  Emits:
+      frame_ready(QImage)      — annotated frame for the video widget
+      stats_updated(int, int)  — (total_count, overlap_count)
+
+    The detection/tracking/counting core mirrors bag_counter_fixed.py:
+      - sticky overlap class (once overlapped, always overlapped)
+      - EMA-smoothed centroids
+      - class-specific confidence thresholds and merge radii
+      - stack-pair suppression (bag directly above overlap = one stack)
+      - class-aware graveyard re-matching and count de-duplication
     """
     frame_ready    = pyqtSignal(QImage)
     stats_updated  = pyqtSignal(int, int)
 
-    # ── Tuning knobs (mirrors backend script) ─────────────────────────────────
+    # ── Tuning knobs (mirrors bag_counter_fixed.py) ───────────────────────────
     FRAME_W                   = 640
     FRAME_H                   = 480
-    LINE_Y_OFFSET             = 40          #added to FRAME_H//2
+    LINE_Y_OFFSET             = 40          # added to FRAME_H//2
     LINE_THICKNESS            = 2
-    SMOOTH_WINDOW             = 8
+    SMOOTH_ALPHA              = 0.25        # EMA smoothing factor
     FORWARD_CONFIRM_FRAMES    = 1
     BACKWARD_CONFIRM_FRAMES   = 8
-    FORWARD_MIN_DISPLACEMENT  = 5
-    BACKWARD_MIN_DISPLACEMENT = 40
+    FORWARD_MIN_DISPLACEMENT  = 10
     DANGER_MARGIN             = 50
     GRAVEYARD_TTL             = 35
     GRAVEYARD_MATCH_PX        = 70
-    DOUBLE_COUNT_RADIUS       = 90
-    MERGE_RADIUS              = 40
-    CONF_THRESH               = 0.70
-    IOU_THRESH                = 0.90
-    FLASH_DURATION            = 0.7        # seconds
+    MERGE_RADIUS_GREEN        = 25          # bag candidates
+    MERGE_RADIUS_PINK         = 40          # overlapped candidates
+    COUNT_DEDUP_RADIUS        = 20
+    BAG_CONF                  = 0.25
+    OVERLAP_CONF              = 0.75
+    TRACK_IOU                 = 0.45
+    FLASH_DURATION            = 0.7         # seconds
+
+    # Stack-pair suppression: a 'bag' box directly above an 'overlapped' box
+    # is the top half of the same physical stack, not a second object.
+    STACK_MAX_DX   = 40   # max horizontal centroid offset for "same column"
+    STACK_MIN_GAP  = -15  # allow slight vertical box overlap
+    STACK_MAX_GAP  = 60   # max vertical gap between bag-bottom and overlap-top
 
     def __init__(self, model_path: str, video_path: str):
         super().__init__()
-        self._model_path = r"C:\Users\siddh\Desktop\adhesive_bag\runs\detect\runs\adhesive_bag\bag_overlapped_head_only\weights\best.pt"
-        self._video_path = r"C:\Users\siddh\Desktop\adhesive_bag\merged_overlapped.mp4"
+        self._model_path = model_path
+        self._video_path = video_path
         self._running    = False
+        self.writer = None
+        self.output_path = ""
 
     # ── Public API ────────────────────────────────────────────────────────────
     def stop(self):
         self._running = False
         self.wait()
 
+    @staticmethod
+    def _resolve_class_id(class_names: dict, name: str) -> int:
+        for k, v in class_names.items():
+            if v == name:
+                return k
+        raise ValueError(
+            f"[MODEL] Expected a class named '{name}' in model.names, "
+            f"but got {class_names}."
+        )
+
     # ── Thread entry ──────────────────────────────────────────────────────────
     def run(self):
         self._running = True
 
+        device   = 'cuda' if torch.cuda.is_available() else 'cpu'
+        USE_HW_VIDEO_IO = True if torch.cuda.is_available() else False
+        use_half = (device == 'cuda')
+
         # Load model
         model = YOLO(self._model_path)
-        CLASS_NAMES     = model.names
-        BAG_CLASS_ID    = next((k for k, v in CLASS_NAMES.items() if v == 'bag'),        0)
-        OVERLAP_CLASS_ID= next((k for k, v in CLASS_NAMES.items() if v == 'overlapped'), 1)
+        #model.to(device)
+        #try:
+            #model.fuse()
+        #except Exception as e:
+           # print(f"[MODEL] fuse() skipped: {e}")
 
-        # Tracker
-        tracker = DeepSort(
-            max_age             = 10,
-            n_init              = 2,
-            max_cosine_distance = 0.70,
-            nn_budget           = 100,
-            max_iou_distance    = 0.85,
-            embedder            = "mobilenet",
-            half                = True,
-            bgr                 = True,
-        )
+        class_names = model.names
+        try:
+            BAG_CLASS_ID     = self._resolve_class_id(class_names, 'bag')
+            OVERLAP_CLASS_ID = self._resolve_class_id(class_names, 'overlapped')
+        except ValueError as e:
+            print(f"[MODEL] {e}")
+            self._running = False
+            return
 
         # Video source
-        cap = cv2.VideoCapture(self._video_path)
+        video_path = self._video_path
+        # Probe the container for its real FPS so we can pace playback to
+        # match it (cap.read() otherwise returns frames as fast as the
+        # decoder can produce them, which on Jetson's hardware decoder is
+        # much faster than real time — the video visibly races ahead).
+        probe_cap = cv2.VideoCapture(video_path)
+        source_fps = probe_cap.get(cv2.CAP_PROP_FPS) if probe_cap.isOpened() else 0
+        probe_cap.release()
+        if not source_fps or source_fps <= 0 or source_fps > 240 or np.isnan(source_fps):
+            print(f"[VIDEO] Could not determine a valid source FPS "
+                  f"({source_fps!r}), defaulting to 30.")
+            source_fps = 30.0
+        frame_interval = 1.0 / source_fps
+        # ==================================================
+        # Output Video
+        # ==================================================
+
+        output_dir = "/home/jetson/Downloads/workspace/results"
+        os.makedirs(output_dir, exist_ok=True)
+
+        video_name = os.path.splitext(
+            os.path.basename(self._video_path)
+        )[0]
+
+        self.output_path = os.path.join(
+            output_dir,
+            f"{video_name}_processed.mp4"
+        )
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        
+        self.writer = cv2.VideoWriter(
+        self.output_path,
+        fourcc,
+        source_fps,
+        (self.FRAME_W, self.FRAME_H)
+        )
+        
+        
+        
+        if USE_HW_VIDEO_IO:
+            #video_path = self._video_path
+            gst_in = (
+                f'filesrc location="{video_path}" ! '
+    		'qtdemux ! h264parse ! '
+    		'nvv4l2decoder ! '
+    		'nvvidconv ! '
+    		f'video/x-raw,format=BGRx,width={self.FRAME_W},height={self.FRAME_H} ! '
+    		'videoconvert ! '
+    		'video/x-raw,format=BGR ! '
+    		'appsink sync=true max-buffers=1'
+                
+            )
+            
+            cap = cv2.VideoCapture(gst_in, cv2.CAP_GSTREAMER)
+        else:
+            cap = cv2.VideoCapture(video_path)
+        # cap = cv2.VideoCapture(self._video_path)
         if not cap.isOpened():
+            print(f"[VIDEO] Could not open: {self._video_path}")
+            self._running = False
             return
 
         W  = self.FRAME_W
@@ -144,20 +232,16 @@ class CountingThread(QThread):
         flash_event   = None
         flash_time    = 0.0
 
-        track_cx_hist        = defaultdict(lambda: deque(maxlen=self.SMOOTH_WINDOW))
-        track_cy_hist        = defaultdict(lambda: deque(maxlen=4))
-        track_confirmed_side = {}
-        track_class          = {}
-        track_count_label    = {}
-        pending              = {}
-        graveyard            = {}
-        recent_commits       = deque(maxlen=10)
+        track_coords          = {}                  # EMA-smoothed centroid
+        track_confirmed_side  = {}
+        track_is_overlap      = defaultdict(bool)    # sticky class
+        track_count_label     = {}
+        pending                = {}
+        graveyard               = {}
+        recent_commits          = deque(maxlen=20)    # (cx, cy, frame, is_ovr)
+        counted_tracks           = {}
 
         # ── Inner helpers (closures over local state) ─────────────────────────
-        def smoothed_cx(tid):
-            h = list(track_cx_hist[tid])
-            return int(np.mean(h)) if h else None
-
         def get_side(cy):
             return 'bottom' if cy > LY else 'top'
 
@@ -168,51 +252,77 @@ class CountingThread(QThread):
             return (crossed_at_cy - cur_cy) if direction == 'forward' \
                    else (cur_cy - crossed_at_cy)
 
-        def find_graveyard_match(cx, cy):
+        def find_graveyard_match(cx, cy, is_ovr):
+            """Class-aware: a lost 'bag' track may only re-match a lost
+            'bag' track, never an 'overlapped' one (and vice versa)."""
             best_id, best_dist = None, self.GRAVEYARD_MATCH_PX
-            for old_id, st in list(graveyard.items()):
-                if frame_number - st['frame_dropped'] > self.GRAVEYARD_TTL:
-                    graveyard.pop(old_id, None)
+            for old_id, st in graveyard.items():
+                if st.get('is_ovr') != is_ovr:
                     continue
                 d = np.hypot(cx - st['cx'], cy - st['cy'])
                 if d < best_dist:
-                    best_dist = d
-                    best_id   = old_id
+                    best_dist, best_id = d, old_id
             return best_id
 
-        def commit_cross(tid, direction):
+        def purge_expired_graveyard():
+            expired = [tid for tid, st in graveyard.items()
+                       if frame_number - st['frame_dropped'] > self.GRAVEYARD_TTL]
+            for tid in expired:
+                graveyard.pop(tid, None)
+                track_confirmed_side.pop(tid, None)
+                track_is_overlap.pop(tid, None)
+                track_coords.pop(tid, None)
+                pending.pop(tid, None)
+
+        def suppress_paired_bag_candidates(candidates):
+            """Drop a 'bag' candidate sitting directly above an 'overlapped'
+            candidate — it's the top half of the same stack, not a second
+            object, so it shouldn't get its own track/crossing/count."""
+            bag_cands = [c for c in candidates if not c['is_ovr']]
+            ovr_cands = [c for c in candidates if c['is_ovr']]
+            kept_bags = []
+            for bag in bag_cands:
+                bcx, b_bottom = bag['cx'], bag['y2']
+                paired = False
+                for ovr in ovr_cands:
+                    ocx, o_top = ovr['cx'], ovr['y1']
+                    if (abs(bcx - ocx) < self.STACK_MAX_DX and
+                            self.STACK_MIN_GAP < (o_top - b_bottom) < self.STACK_MAX_GAP):
+                        paired = True
+                        break
+                if not paired:
+                    kept_bags.append(bag)
+            return kept_bags + ovr_cands
+
+        def commit_cross(tid, direction, cx, cy):
             nonlocal count, overlap_count, flash_event, flash_time
+            is_ovr = track_is_overlap[tid]
 
-            hcx = list(track_cx_hist[tid])
-            hcy = list(track_cy_hist[tid])
-            cx  = hcx[-1] if hcx else 0
-            cy  = hcy[-1] if hcy else 0
+            if counted_tracks.get(tid, False):
+                return
 
-            for rcx, rcy, rframe in recent_commits:
-                if frame_number - rframe > 8:
+            # Class-aware spatial de-dup (bag and overlap don't block each other)
+            for rcx, rcy, rframe, r_is_ovr in recent_commits:
+                if frame_number - rframe > 15:
                     continue
-                if np.hypot(cx - rcx, cy - rcy) < self.DOUBLE_COUNT_RADIUS:
-                    return   # spatial dedup
+                if r_is_ovr == is_ovr and np.hypot(cx - rcx, cy - rcy) < self.COUNT_DEDUP_RADIUS:
+                    counted_tracks[tid] = True
+                    return
 
-            recent_commits.append((cx, cy, frame_number))
-            is_overlapped = track_class.get(tid) == OVERLAP_CLASS_ID
+            recent_commits.append((cx, cy, frame_number, is_ovr))
+            counted_tracks[tid] = True
 
-            if direction == 'forward':
-                if is_overlapped:
-                    count         += 2
-                    overlap_count += 1
-                    flash_event    = 'overlap'
-                else:
-                    count      += 1
-                    flash_event = '+'
+            if direction != 'forward':
+                flash_event = None
+                return
+
+            if is_ovr:
+                count += 1
+                overlap_count += 1
+                flash_event = 'overlap'
             else:
-                if is_overlapped:
-                    count         = max(0, count - 2)
-                    overlap_count = max(0, overlap_count - 1)
-                    flash_event   = 'overlap_back'
-                else:
-                    count      = max(0, count - 1)
-                    flash_event = '-'
+                count += 1
+                flash_event = '+'
 
             track_count_label[tid] = count
             flash_time = time.time()
@@ -227,75 +337,107 @@ class CountingThread(QThread):
             frame        = cv2.resize(frame, (W, H))
             frame_number += 1
             seen_ids     = set()
-            processed_positions = []
 
-            # YOLO inference
-            results    = model(frame, imgsz=640,
-                               conf=self.CONF_THRESH,
-                               iou=self.IOU_THRESH,
-                               verbose=False)
-            detections = []
-            for r in results:
-                for box in r.boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    cls = int(box.cls[0])
-                    detections.append((
-                        [x1, y1, x2 - x1, y2 - y1],
-                        float(box.conf[0]),
-                        cls
-                    ))
-
-            # DeepSORT
-            tracks = tracker.update_tracks(detections, frame=frame)
+            # YOLO detection + ByteTrack tracking (single pass)
+            results = model.track(
+                frame,
+                persist=True,
+                tracker="bytetrack.yaml",
+                iou=self.TRACK_IOU,
+                verbose=False,
+                device=device,
+                half=use_half,
+            )
 
             # ── Draw counting line  (neon red) ────────────────────────────────
-            cv2.line(frame, (0, LY), (W, LY), (255, 23, 68), self.LINE_THICKNESS)
-            # Glow duplicate lines
-            cv2.line(frame, (0, LY), (W, LY), (180, 0, 40, ), 1)
+            cv2.line(frame, (W//2, LY), (W, LY), (255, 23, 68), self.LINE_THICKNESS)
+            cv2.line(frame, (W//2, LY), (W, LY), (180, 0, 40), 1)
 
-            # ── Per-track processing ──────────────────────────────────────────
-            for track in tracks:
-                if not track.is_confirmed():
+            # ── Collect candidates for this frame ─────────────────────────────
+            candidates = []
+            for r in results:
+                boxes = r.boxes
+                if boxes is None or boxes.id is None:
                     continue
 
-                tid           = track.track_id
-                l, t, rc, b  = track.to_ltrb()
-                x1, y1, x2, y2 = int(l), int(t), int(rc), int(b)
+                ids     = boxes.id.cpu().numpy().astype(int)
+                xyxy    = boxes.xyxy.cpu().numpy()
+                classes = boxes.cls.cpu().numpy().astype(int)
+                confs   = boxes.conf.cpu().numpy()
 
-                raw_cx = (x1 + x2) // 2
-                cy     = (y1 + y2) // 2
+                for tid, box, class_id, conf in zip(ids, xyxy, classes, confs):
+                    x1, y1, x2, y2 = box
 
-                track_cx_hist[tid].append(raw_cx)
-                track_cy_hist[tid].append(cy)
-                cx = smoothed_cx(tid)
+                    # Class-specific confidence filtering
+                    if class_id == BAG_CLASS_ID and conf < self.BAG_CONF:
+                        continue
+                    if class_id == OVERLAP_CLASS_ID and conf < self.OVERLAP_CONF:
+                        continue
 
-                if track.det_class is not None:
-                    track_class[tid] = track.det_class
+                    raw_cx = int((x1 + x2) / 2)
+                    raw_cy = int((y1 + y2) / 2)
 
-                # Duplicate suppression
-                is_dup = any(
-                    np.hypot(cx - px, cy - py) < self.MERGE_RADIUS
-                    for px, py in processed_positions
-                )
-                if is_dup:
-                    cv2.circle(frame, (cx, cy), 4, (80, 80, 80), -1)
-                    continue
-                processed_positions.append((cx, cy))
+                    seen_ids.add(tid)
+
+                    # Sticky class: once overlapped, always overlapped
+                    if class_id == OVERLAP_CLASS_ID:
+                        track_is_overlap[tid] = True
+
+                    # EMA smoothing on centroid
+                    if tid not in track_coords:
+                        track_coords[tid] = (raw_cx, raw_cy)
+                    else:
+                        pcx, pcy = track_coords[tid]
+                        track_coords[tid] = (
+                            int(self.SMOOTH_ALPHA * raw_cx + (1 - self.SMOOTH_ALPHA) * pcx),
+                            int(self.SMOOTH_ALPHA * raw_cy + (1 - self.SMOOTH_ALPHA) * pcy),
+                        )
+
+                    cx, cy = track_coords[tid]
+                    candidates.append({
+                        'id': tid, 'cx': cx, 'cy': cy,
+                        'is_ovr': track_is_overlap[tid],
+                        'x1': float(x1), 'y1': float(y1),
+                        'x2': float(x2), 'y2': float(y2),
+                    })
+
+            # Collapse paired top-bag + bottom-overlap candidates into one
+            candidates = suppress_paired_bag_candidates(candidates)
+
+            # Class-specific merging: process overlaps (pink) first so they
+            # have priority when two close-together candidates compete.
+            candidates.sort(key=lambda c: c['is_ovr'], reverse=True)
+            processed_green, processed_pink = [], []
+
+            # ── Per-candidate processing ───────────────────────────────────────
+            for cand in candidates:
+                tid, cx, cy, is_ovr = cand['id'], cand['cx'], cand['cy'], cand['is_ovr']
+                x1, y1, x2, y2 = int(cand['x1']), int(cand['y1']), int(cand['x2']), int(cand['y2'])
+
+                if is_ovr:
+                    if any(np.hypot(cx - px, cy - py) < self.MERGE_RADIUS_PINK
+                           for px, py in processed_pink):
+                        cv2.circle(frame, (cx, cy), 4, (80, 80, 80), -1)
+                        continue
+                    processed_pink.append((cx, cy))
+                else:
+                    if any(np.hypot(cx - px, cy - py) < self.MERGE_RADIUS_GREEN
+                           for px, py in processed_green):
+                        cv2.circle(frame, (cx, cy), 4, (80, 80, 80), -1)
+                        continue
+                    processed_green.append((cx, cy))
 
                 current_side = get_side(cy)
-                seen_ids.add(tid)
 
-                # Graveyard inheritance
+                # Graveyard inheritance (class-aware match)
                 if tid not in track_confirmed_side:
-                    old_id = find_graveyard_match(cx, cy)
+                    old_id = find_graveyard_match(cx, cy, is_ovr)
                     if old_id is not None:
                         track_confirmed_side[tid] = graveyard[old_id]['side']
-                        if old_id in track_class:
-                            track_class[tid] = track_class[old_id]
+                        track_is_overlap[tid] = track_is_overlap.get(old_id, is_ovr)
+                        counted_tracks[tid] = graveyard[old_id].get('counted', False)
                         if old_id in track_count_label:
                             track_count_label[tid] = track_count_label[old_id]
-                        if old_id in pending:
-                            pending[tid] = pending.pop(old_id)
                         graveyard.pop(old_id, None)
                     else:
                         track_confirmed_side[tid] = current_side
@@ -305,8 +447,7 @@ class CountingThread(QThread):
                 # Crossing state machine
                 if tid not in pending:
                     if current_side != confirmed_side:
-                        direction = ('forward' if confirmed_side == 'bottom'
-                                     else 'backward')
+                        direction = 'forward' if confirmed_side == 'bottom' else 'backward'
                         pending[tid] = {
                             'direction'         : direction,
                             'frames_on_new_side': 1,
@@ -316,31 +457,24 @@ class CountingThread(QThread):
                     p = pending[tid]
                     if current_side != confirmed_side:
                         p['frames_on_new_side'] += 1
-                        direction      = p['direction']
-                        confirm_needed = (self.FORWARD_CONFIRM_FRAMES
-                                          if direction == 'forward'
-                                          else self.BACKWARD_CONFIRM_FRAMES)
-                        min_disp       = (self.FORWARD_MIN_DISPLACEMENT
-                                          if direction == 'forward'
-                                          else self.BACKWARD_MIN_DISPLACEMENT)
-                        displacement   = net_displacement(
-                            p['crossed_at_cy'], cy, direction)
+                        direction    = p['direction']
+                        req_frames   = (self.FORWARD_CONFIRM_FRAMES if direction == 'forward'
+                                        else self.BACKWARD_CONFIRM_FRAMES)
+                        displacement = net_displacement(p['crossed_at_cy'], cy, direction)
 
-                        if (p['frames_on_new_side'] >= confirm_needed
-                                and displacement >= min_disp):
-                            commit_cross(tid, direction)
+                        if (p['frames_on_new_side'] >= req_frames
+                                and displacement >= self.FORWARD_MIN_DISPLACEMENT):
+                            commit_cross(tid, direction, cx, cy)
                             track_confirmed_side[tid] = current_side
                             pending.pop(tid, None)
                     else:
                         pending.pop(tid, None)
 
                 # ── Visual annotation ─────────────────────────────────────────
-                in_zone      = in_danger_zone(cy)
-                has_pend     = tid in pending
-                is_overlapped= track_class.get(tid) == OVERLAP_CLASS_ID
+                in_zone  = in_danger_zone(cy)
+                has_pend = tid in pending
 
-                # Bounding box color
-                if is_overlapped:
+                if is_ovr:
                     box_color = (255, 179, 0)      # AMBER_GLOW in BGR
                     dot_col   = (255, 0, 255)       # magenta
                 elif has_pend and in_zone:
@@ -364,7 +498,7 @@ class CountingThread(QThread):
                     cv2.line(frame, (cx_, cy_), (cx_, cy_ + dy*tick), box_color, 2)
 
                 # ID chip
-                label_txt = f"OVR #{tid}" if is_overlapped else f"#{tid}"
+                label_txt = f"OVR #{tid}" if is_ovr else f"#{tid}"
                 lbl_size, _ = cv2.getTextSize(
                     label_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
                 lbl_x, lbl_y = x1, max(y1 - 4, 18)
@@ -372,9 +506,9 @@ class CountingThread(QThread):
                               (lbl_x, lbl_y - lbl_size[1] - 4),
                               (lbl_x + lbl_size[0] + 6, lbl_y + 2),
                               box_color, -1)
-                cv2.putText(frame, label_txt,
-                            (lbl_x + 3, lbl_y - 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
+                # cv2.putText(frame, label_txt,
+                #             (lbl_x + 3, lbl_y - 2),
+                #             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
 
                 # Center dot
                 cv2.circle(frame, (cx, cy), 6, dot_col, -1)
@@ -389,48 +523,34 @@ class CountingThread(QThread):
                     cv2.putText(frame, ct, (tx, ty),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.85,
                                 (255, 255, 255), 2)
-                    cv2.putText(frame, ct, (tx, ty),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                                (0, 0, 0), 1)
+                    # cv2.putText(frame, ct, (tx, ty),
+                    #             cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                    #             (0, 0, 0), 1)
 
-            # ── Move dropped tracks to graveyard ──────────────────────────────
+            # ── Move dropped tracks to graveyard (class-aware) ────────────────
             for lost_id in set(track_confirmed_side.keys()) - seen_ids:
-                if lost_id not in graveyard:
-                    hcx = list(track_cx_hist[lost_id])
-                    hcy = list(track_cy_hist[lost_id])
+                if lost_id not in graveyard and lost_id in track_coords:
+                    lcx, lcy = track_coords[lost_id]
                     graveyard[lost_id] = {
-                        'cx'           : hcx[-1] if hcx else W // 2,
-                        'cy'           : hcy[-1] if hcy else H,
+                        'cx'           : lcx,
+                        'cy'           : lcy,
                         'side'         : track_confirmed_side[lost_id],
                         'frame_dropped': frame_number,
+                        'counted'      : counted_tracks.get(lost_id, False),
+                        'is_ovr'       : track_is_overlap.get(lost_id, False),
                     }
 
-            # ── Graveyard: auto-commit lost forward crossings ─────────────────
-            for lost_id, p in list(pending.items()):
-                if lost_id not in seen_ids:
-                    st = graveyard.get(lost_id, {})
-                    frames_since = frame_number - st.get(
-                        'frame_dropped', frame_number)
-                    if (p['direction'] == 'forward'
-                            and frames_since >= 10
-                            and p['frames_on_new_side'] >= self.FORWARD_CONFIRM_FRAMES):
-                        commit_cross(lost_id, 'forward')
-                        track_confirmed_side[lost_id] = 'top'
-                        pending.pop(lost_id, None)
-                    elif frames_since >= self.GRAVEYARD_TTL:
-                        pending.pop(lost_id, None)
+            purge_expired_graveyard()
 
             # ── Flash overlay ─────────────────────────────────────────────────
             if flash_event and (time.time() - flash_time) < self.FLASH_DURATION:
                 fmap = {
-                    '+'           : ((20, 219, 20),   f"+1  [{count}]"),
-                    '-'           : ((68, 23, 255),    f"-1  [{count}]"),
-                    'overlap'     : ((255, 0, 255),    f"+2 OVR  [{count}]"),
-                    'overlap_back': ((200, 0, 200),    f"-2 OVR  [{count}]"),
+                    '+'      : ((20, 219, 20), f"+1  [{count}]"),
+                    'overlap': ((255, 0, 255), f"+1 OVR  [{count}]"),
                 }
-                fc, txt = fmap.get(flash_event, ((255,255,255), ""))
-                cv2.putText(frame, txt, (10, LY - 18),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, fc, 2)
+                fc, txt = fmap.get(flash_event, ((255, 255, 255), ""))
+                # cv2.putText(frame, txt, (10, LY - 18),
+                #             cv2.FONT_HERSHEY_SIMPLEX, 1.0, fc, 2)
             else:
                 flash_event = None
 
@@ -441,13 +561,21 @@ class CountingThread(QThread):
                         (255, 23, 68), 1)
 
             # ── Convert BGR→RGB and emit ──────────────────────────────────────
+            
+            if self.writer is not None:
+                self.writer.write(frame)
             rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb.shape
             qimg  = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
             self.frame_ready.emit(qimg.copy())
 
         cap.release()
+        
+        if self.writer is not None:
+            self.writer.release()
+            
         self._running = False
+        print(f"Saved video: {self.output_path}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -973,7 +1101,7 @@ class FactoryDashboard(QMainWindow):
         lay.setSpacing(24)
 
         self._model_picker = PathPickerRow(
-            "Model (.pt)", "Model weights (*.pt *.pth)")
+            "Model (.pt)", "Model weights (*.pt *.pth *.engine)")
         self._video_picker = PathPickerRow(
             "Video", "Video files (*.mp4 *.avi *.mov *.mkv)")
 
