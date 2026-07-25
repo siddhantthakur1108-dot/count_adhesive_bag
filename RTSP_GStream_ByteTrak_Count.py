@@ -186,9 +186,12 @@ class CountingThread(QThread):
         output_dir = "/home/jetson/Downloads/workspace/results"
         os.makedirs(output_dir, exist_ok=True)
 
-        video_name = os.path.splitext(
-            os.path.basename(test)
-        )[0]
+        if is_rtsp:
+            video_name = "rtsp_stream"
+        else:
+            video_name = os.path.splitext(
+                os.path.basename(video_path)
+            )[0]
 
         self.output_path = os.path.join(
             output_dir,
@@ -208,15 +211,15 @@ class CountingThread(QThread):
             if is_rtsp:
                 gst_in = (
                     f'rtspsrc location="{video_path}" latency=50 protocols=tcp ! '
-                    'rtph264depay ! '
-                    'h264parse ! '
+                    'rtph265depay ! '
+                    'h265parse ! '
                     'nvv4l2decoder ! '
                     'nvvidconv ! '
                     f'video/x-raw,width={self.FRAME_W},height={self.FRAME_H},format=BGRx ! '
                     'videoconvert ! '
                     'video/x-raw,format=BGR ! '
                     'appsink sync=false max-buffers=1 drop=true'
-    )
+                )
             else:
                 gst_in = (
                     f'filesrc location="{video_path}" ! '
@@ -347,6 +350,9 @@ class CountingThread(QThread):
             flash_time = time.time()
             self.stats_updated.emit(count, overlap_count)
 
+
+        fps_counter = 0
+        fps_start = time.time()
         # ── Main loop ─────────────────────────────────────────────────────────
         while self._running and cap.isOpened():
             ret, frame = cap.read()
@@ -588,6 +594,16 @@ class CountingThread(QThread):
             h, w, ch = rgb.shape
             qimg  = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
             self.frame_ready.emit(qimg.copy())
+
+            fps_counter += 1
+
+            elapsed = time.time() - fps_start
+            if elapsed >= 1.0:
+                fps = fps_counter / elapsed
+                print(f"Processing FPS: {fps:.2f}")
+
+                fps_counter = 0
+                fps_start = time.time()
 
         cap.release()
         
@@ -1276,16 +1292,20 @@ class FactoryDashboard(QMainWindow):
     def _start_counting(self):
         model_path = self._model_picker.path
         video_path = self._video_picker.path
+        rtsp_url = self._rtsp_edit.text().strip()
 
         if not model_path:
             QMessageBox.warning(self, "No model selected",
                                 "Please browse and select a YOLO .pt model file.")
             return
-        if not video_path:
-            QMessageBox.warning(self, "No video selected",
-                                "Please browse and select a video file.")
+        if not video_path and not rtsp_url:
+            QMessageBox.warning(
+                self,
+                "No source selected",
+                "Please select a video file or enter an RTSP URL."
+            )
             return
-
+        
         self._counting       = True
         self._start_time     = datetime.now()
         self._total_count    = 0
